@@ -164,7 +164,7 @@ pub(super) fn writers(items: &[Late]) -> Vec<Writer> {
                 }
                 out.extend(flight.own.iter().flat_map(Taken::copied));
             }
-            Late::Write(at, _, bytes) => out.push(Writer {
+            Late::Write(at, _, bytes, _) => out.push(Writer {
                 shadow: None,
                 from: *at,
                 to: *at + *bytes,

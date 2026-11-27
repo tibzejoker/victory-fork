@@ -3270,13 +3270,131 @@ struct Flight {
     texture_back_ranges: Vec<(usize, usize)>,
 }
 
+/// `VICTORY_FENCE_LAG` (on unless `0`): how late the title is told that its
+/// work is done. For every tell (a fence signalled, a bottom-of-pipe write)
+/// the time from its going into the line to its being told, and for the
+/// relay's tells the part of it spent in the landing that told it; for every
+/// landing its flights and length. Said every 5 s. Measurement only.
+mod fence_lag {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct Kind {
+        n: u64,
+        sum_us: u64,
+        max_us: u64,
+        over_100ms: u64,
+        in_landing_sum_us: u64,
+        in_landing_max_us: u64,
+    }
+
+    #[derive(Default)]
+    struct Sums {
+        signals: Kind,
+        writes: Kind,
+        settled: u64,
+        landings: u64,
+        flights: u64,
+        most_flights: u64,
+        landing_sum_us: u64,
+        landing_max_us: u64,
+        said: Option<Instant>,
+    }
+
+    static SUMS: Mutex<Option<Sums>> = Mutex::new(None);
+
+    fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("VICTORY_FENCE_LAG").map_or(true, |v| v.trim() != "0"))
+    }
+
+    pub(super) fn told(signal: bool, queued: Instant, landing: Option<Instant>) {
+        if !on() {
+            return;
+        }
+        let age = queued.elapsed().as_micros() as u64;
+        let mut g = SUMS.lock().unwrap_or_else(|e| e.into_inner());
+        let s = g.get_or_insert_with(Sums::default);
+        let k = if signal { &mut s.signals } else { &mut s.writes };
+        k.n += 1;
+        k.sum_us += age;
+        k.max_us = k.max_us.max(age);
+        if age > 100_000 {
+            k.over_100ms += 1;
+        }
+        match landing {
+            Some(l) => {
+                let in_landing = l.elapsed().as_micros() as u64;
+                k.in_landing_sum_us += in_landing;
+                k.in_landing_max_us = k.in_landing_max_us.max(in_landing);
+            }
+            None => s.settled += 1,
+        }
+        say(s);
+    }
+
+    pub(super) fn landed(flights: usize, took: Duration) {
+        if !on() {
+            return;
+        }
+        let mut g = SUMS.lock().unwrap_or_else(|e| e.into_inner());
+        let s = g.get_or_insert_with(Sums::default);
+        s.landings += 1;
+        s.flights += flights as u64;
+        s.most_flights = s.most_flights.max(flights as u64);
+        let us = took.as_micros() as u64;
+        s.landing_sum_us += us;
+        s.landing_max_us = s.landing_max_us.max(us);
+        say(s);
+    }
+
+    fn say(s: &mut Sums) {
+        let now = Instant::now();
+        let Some(at) = s.said else {
+            s.said = Some(now);
+            return;
+        };
+        if now.duration_since(at).as_secs() < 5 {
+            return;
+        }
+        let ms = |us: u64| us as f64 / 1e3;
+        let mean = |k: &Kind| if k.n > 0 { ms(k.sum_us) / k.n as f64 } else { 0.0 };
+        let mean_in = |k: &Kind| if k.n > 0 { ms(k.in_landing_sum_us) / k.n as f64 } else { 0.0 };
+        let landings = s.landings.max(1) as f64;
+        tracing::info!(
+            "fence lag (VICTORY_FENCE_LAG), last {:.0} s: signals {} told, {:.1} ms mean from the line to told (worst {:.1}, {} over 100 ms), of it {:.1} ms in the landing (worst {:.1}); bottom-of-pipe writes {} told, {:.1} ms mean (worst {:.1}, {} over 100 ms), {:.1} in the landing (worst {:.1}); {} told by settles; landings {}, {:.1} flights each (most {}), {:.1} ms each (longest {:.1})",
+            now.duration_since(at).as_secs_f64(),
+            s.signals.n,
+            mean(&s.signals),
+            ms(s.signals.max_us),
+            s.signals.over_100ms,
+            mean_in(&s.signals),
+            ms(s.signals.in_landing_max_us),
+            s.writes.n,
+            mean(&s.writes),
+            ms(s.writes.max_us),
+            s.writes.over_100ms,
+            mean_in(&s.writes),
+            ms(s.writes.in_landing_max_us),
+            s.settled,
+            s.landings,
+            s.flights as f64 / landings,
+            s.most_flights,
+            ms(s.landing_sum_us) / landings,
+            ms(s.landing_max_us)
+        );
+        *s = Sums { said: Some(now), ..Sums::default() };
+    }
+}
+
 /// One thing in the line of what waits for the card, in order.
 enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
-    Write(usize, crate::queue::Written, usize),
+    Write(usize, crate::queue::Written, usize, std::time::Instant),
     /// A fence (its address) signalled behind the flights before it.
-    Signal(usize, u64),
+    Signal(usize, u64, std::time::Instant),
 }
 
 struct Line {
@@ -3784,7 +3902,7 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
         }
         return false;
     }
-    line.line.push(Late::Signal(fence, value));
+    line.line.push(Late::Signal(fence, value, std::time::Instant::now()));
     LATE_STATS[14].fetch_add(1, Ordering::Relaxed);
     drop(line);
     // A signal alone (behind a settle under way) has no flight to wake
@@ -3820,7 +3938,7 @@ pub(crate) fn late_met_known(wait: &crate::list::ValueWait) -> Option<bool> {
         let mut unsure = touches(&line.written, address, address + bytes);
         // (With the relay: first the writes of flights being landed.)
         let writes = line.in_hand.iter().map(|(at, what, n)| (at, what, n)).chain(line.line.iter().filter_map(|item| match item {
-            Late::Write(at, what, n) => Some((at, what, n)),
+            Late::Write(at, what, n, _) => Some((at, what, n)),
             _ => None,
         }));
         for (at, what, n) in writes {
@@ -4082,7 +4200,7 @@ fn relay_worker() {
                 line.in_hand = items
                     .iter()
                     .filter_map(|l| match l {
-                        Late::Write(at, what, bytes) => Some((*at, *what, *bytes)),
+                        Late::Write(at, what, bytes, _) => Some((*at, *what, *bytes)),
                         _ => None,
                     })
                     .collect();
@@ -5625,6 +5743,7 @@ impl Host {
     /// is complete before the title is told anything.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        let last_flights = items.iter().filter(|l| matches!(l, Late::Run(_))).count();
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
             let flights: Vec<&Flight> = items
@@ -5706,12 +5825,14 @@ impl Host {
                     landed.push((flight.lists, flight.order));
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
                 }
-                Late::Write(at, what, bytes) => {
+                Late::Write(at, what, bytes, queued) => {
                     what.write(at as *mut u8, bytes);
+                    fence_lag::told(false, queued, Some(landing));
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
-                Late::Signal(fence, value) => {
+                Late::Signal(fence, value, queued) => {
                     crate::fence::set(fence as crate::object::This, value);
+                    fence_lag::told(true, queued, Some(landing));
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
             };
@@ -5724,6 +5845,7 @@ impl Host {
         self.log_messages();
         crate::land::spent(crate::land::stat::REST, telling);
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+        fence_lag::landed(last_flights, landing.elapsed());
         {
             let mut line = line();
             let Line {
@@ -6010,7 +6132,7 @@ impl Host {
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
             }));
-            items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
+            items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes, std::time::Instant::now())));
             SENDING.fetch_sub(1, Ordering::AcqRel);
             *flying >= late_most()
         };
@@ -6066,7 +6188,7 @@ impl Host {
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
             }));
-            items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
+            items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes, std::time::Instant::now())));
         }
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
         LINE_MOVED.notify_one();
@@ -6211,8 +6333,14 @@ impl Host {
                         }
                         landed.push((flight.lists, flight.order));
                     }
-                    Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                    Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                    Late::Write(at, what, bytes, queued) => {
+                        what.write(at as *mut u8, bytes);
+                        fence_lag::told(false, queued, None);
+                    }
+                    Late::Signal(fence, value, queued) => {
+                        crate::fence::set(fence as crate::object::This, value);
+                        fence_lag::told(true, queued, None);
+                    }
                 }
             }
             if last > 0 {
