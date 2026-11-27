@@ -2116,9 +2116,16 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`]: a quarter of the processor's
+/// threads, 2 to 6; `VICTORY_WIDE_THREADS` asks for another count (2 up to
+/// half of the processor's threads, so that a smaller processor is not
+/// swamped by a number meant for a larger one).
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    let all = std::thread::available_parallelism().map_or(4, |n| n.get());
+    match std::env::var("VICTORY_WIDE_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(asked) => asked.clamp(2, (all / 2).max(2)),
+        None => (all / 4).clamp(2, 6),
+    }
 }
 
 fn workers() -> &'static Workers {

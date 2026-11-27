@@ -205,13 +205,47 @@ pub(crate) fn lock_waits(frames: f64) -> String {
 /// Taken before the journal's lock, never under it.
 static ASKING: (Mutex<Vec<(usize, usize)>>, Condvar) = (Mutex::new(Vec::new()), Condvar::new());
 
+/// Threads waiting in [`Asking::hold`] for a range another holds (counted
+/// under [`ASKING`]'s lock): a drop wakes them only if there are any.
+static ASKING_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether [`ASKING`]'s lock is taken by trying and spinning, and its
+/// waiters woken only when there are some (`VICTORY_ASKING_SPIN`; on by
+/// default, 0: the plain lock and a wake at every drop, as before). The
+/// lock is held for a look at a few ranges, 1,100 times a frame in the city
+/// (560 ranges asked alone, taken and let go) from the submitting thread
+/// and the threads beside it: with the plain lock a profile had the
+/// submitting thread asleep on it 8,200 times in 11 s, 600 ms of it.
+fn asking_spins() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASKING_SPIN").is_none_or(|v| v != "0"))
+}
+
+fn asking() -> std::sync::MutexGuard<'static, Vec<(usize, usize)>> {
+    if asking_spins() {
+        for _ in 0..200 {
+            match ASKING.0.try_lock() {
+                Ok(held) => return held,
+                Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    for _ in 0..8 {
+                        std::hint::spin_loop();
+                    }
+                }
+            }
+        }
+    }
+    ASKING.0.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Pages `[first, last)` held in [`ASKING`] until dropped.
 struct Asking(usize, usize);
 
 impl Asking {
     fn hold(first: usize, last: usize) -> Asking {
-        let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut held = asking();
         if held.iter().any(|&(a, b)| a < last && first < b) {
+            ASKING_WAITERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             held = waited(0, || {
                 let mut held = held;
                 while held.iter().any(|&(a, b)| a < last && first < b) {
@@ -219,6 +253,7 @@ impl Asking {
                 }
                 held
             });
+            ASKING_WAITERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
         held.push((first, last));
         Asking(first, last)
@@ -232,12 +267,16 @@ impl Asking {
 
 impl Drop for Asking {
     fn drop(&mut self) {
-        let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut held = asking();
         if let Some(i) = held.iter().position(|&r| r == (self.0, self.1)) {
             held.swap_remove(i);
         }
         drop(held);
-        ASKING.1.notify_all();
+        // (A waiter counts itself under the lock before it waits, so one that
+        // saw this range held is counted by now.)
+        if !asking_spins() || ASKING_WAITERS.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            ASKING.1.notify_all();
+        }
     }
 }
 
@@ -1281,7 +1320,7 @@ pub(crate) fn opened_for_writing(at: usize) {
 
 /// An asking made blocks of `pages` clean and noted them in the journal.
 fn publish(pages: &[usize]) {
-    let g = guards();
+    let g = guards_look();
     for &page in pages {
         if g.clean.contains(page) || g.held.contains(page) {
             PUBLISHED.set(page);
@@ -1443,7 +1482,7 @@ pub(crate) fn asks() -> [u64; 13] {
 }
 
 /// The guards' lock, the wait for it counted.
-fn guards_timed() -> std::sync::MutexGuard<'static, Guards> {
+fn guards_timed() -> std::sync::RwLockWriteGuard<'static, Guards> {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let g = guards();
@@ -1650,7 +1689,7 @@ impl Guards {
     }
 }
 
-static GUARDS: Mutex<Guards> = Mutex::new(Guards {
+static GUARDS: std::sync::RwLock<Guards> = std::sync::RwLock::new(Guards {
     protected: Blocks::new(),
     clean: Blocks::new(),
     absent: Blocks::new(),
@@ -1662,11 +1701,43 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
 });
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    if let Ok(g) = GUARDS.try_lock() {
+fn guards() -> std::sync::RwLockWriteGuard<'static, Guards> {
+    if let Ok(g) = GUARDS.try_write() {
         return g;
     }
-    waited(3, || GUARDS.lock().unwrap_or_else(|e| e.into_inner()))
+    waited(3, || GUARDS.write().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// The guards to look at only: several threads at once. A submission's
+/// refreshes ask about some 300 view ranges a frame from the submitting
+/// thread and the threads beside it, nearly all of them clean, and each
+/// asking only looks; under one lock for lookers and changers a profile in
+/// the city had the submitting thread asleep on it 8,200 times in 11 s
+/// (600 ms). `VICTORY_GUARDS_SHARED=0`: lookers take it alone, as before.
+fn guards_look() -> GuardsLook {
+    static SHARED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*SHARED.get_or_init(|| std::env::var_os("VICTORY_GUARDS_SHARED").is_none_or(|v| v != "0")) {
+        return GuardsLook::Alone(guards());
+    }
+    if let Ok(g) = GUARDS.try_read() {
+        return GuardsLook::Shared(g);
+    }
+    GuardsLook::Shared(waited(3, || GUARDS.read().unwrap_or_else(|e| e.into_inner())))
+}
+
+enum GuardsLook {
+    Shared(std::sync::RwLockReadGuard<'static, Guards>),
+    Alone(std::sync::RwLockWriteGuard<'static, Guards>),
+}
+
+impl std::ops::Deref for GuardsLook {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        match self {
+            GuardsLook::Shared(g) => g,
+            GuardsLook::Alone(g) => g,
+        }
+    }
 }
 
 /// The 4 KiB pages of title memory that what shaders wrote was put into,
@@ -1862,7 +1933,7 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
     if len == 0 {
         return false;
     }
-    let g = guards();
+    let g = guards_look();
     (at / BLOCK..=(at + len - 1) / BLOCK)
         .all(|b| !g.clean.contains(b) && !g.absent.contains(b) && !g.protected.contains(b))
 }
@@ -1882,7 +1953,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
         && (PROTECTED.any(first, first + 1) || {
-            let g = guards_timed();
+            let g = guards_look();
             g.protected.contains(first) || g.absent.contains(first)
         });
     if !known && !is_view(start, end) {
@@ -1894,7 +1965,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // other thread asks about it: `ASKING`); what the runtime tells meanwhile
     // takes the block out of the set, and it is looked at as any other.
     let unsure: Vec<usize> = {
-        let g = guards_timed();
+        let g = guards_look();
         if g.clean.range(first..last).count() == last - first && !BESIDE.any(first, last) {
             // Nothing written, mapped or new since the range was last taken.
             #[cfg(feature = "diagnostics")]
@@ -2763,7 +2834,7 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
-fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static, Guards> {
+fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'static, Guards> {
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
